@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nollama"
+version = "0.1.0"
+description = "Lightweight agentic loop infrastructure for Claude and local Ollama projects"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "anthropic",
+    "pandas",
+]
+
+[project.optional-dependencies]
+ollama = ["ollama"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nollama*"]
