@@ -159,6 +159,31 @@ def _functions_to_claude_tools(fns: list) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DYNAMIC TOOLS — registry construction
+# DynamicToolRegistry itself is defined further down; this builds one from a path
+# at call time. (Only referenced inside the loops, so forward refs are fine.)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DEFAULT_DYNAMIC_TOOLS_PATH = os.path.join("dynamic_tools", "dynamic_tools.json")
+
+
+def _make_registry(path: str | None, db_path: str | None):
+    """Build a DynamicToolRegistry from a path, loading any saved tools.
+
+    Returns None when path is None (dynamic tools disabled). Created tools get
+    sqlite3/pd/json in their namespace, plus DB_PATH when a db is in use.
+    """
+    if path is None:
+        return None
+    safe_globals = {"sqlite3": sqlite3, "pd": pd, "json": json}
+    if db_path is not None:
+        safe_globals["DB_PATH"] = db_path
+    registry = DynamicToolRegistry(path, safe_globals)
+    registry.load()
+    return registry
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CLAUDE AGENTIC LOOP
 # Runs until the model stops calling tools and returns a final text response.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -176,6 +201,8 @@ def run_loop_claude(
         verbose: bool = True,
         db_path: str | None = None,
         cache_out: dict | None = None,
+        dynamic_tools_path: str | None = _DEFAULT_DYNAMIC_TOOLS_PATH,
+        allow_create: bool = True,
 ) -> str:
     """
     Run a tool-call loop against the Anthropic API until the model returns
@@ -196,6 +223,14 @@ def run_loop_claude(
         cache_out:  Optional dict that is populated with {query_id: DataFrame}
                     entries after the loop finishes. Only used when db_path
                     is set.
+        dynamic_tools_path: Path to the JSON file where dynamic tools are
+                    persisted. Loaded if it exists, created on first save.
+                    Defaults to dynamic_tools/dynamic_tools.json. Pass None
+                    to disable dynamic tools entirely.
+        allow_create: When True (default), the model gets a create_tool tool
+                    and tools it creates mid-session become callable on the
+                    next turn. Set False to expose saved dynamic tools
+                    read-only.
 
     Returns:
         The model's final plain-text response.
@@ -209,13 +244,22 @@ def run_loop_claude(
     if db_path is not None:
         _cache = QueryCache()
         tools = tools + make_sql_tools(db_path, _cache)
+    registry = _make_registry(dynamic_tools_path, db_path)
+    if registry is not None and allow_create:
+        tools = tools + [registry.create_tool_fn()]
 
-    tool_registry = {fn.__name__: fn for fn in tools}
-    claude_tools = _functions_to_claude_tools(tools)
+    def assemble():
+        # registry.callables() can grow mid-loop as the model creates tools
+        all_tools = tools + (registry.callables() if registry is not None else [])
+        return {fn.__name__: fn for fn in all_tools}, _functions_to_claude_tools(all_tools)
+
+    tool_registry, claude_tools = assemble()
 
     total_input = total_output = total_cache_read = total_cache_write = 0
 
     while True:
+        if registry is not None:
+            tool_registry, claude_tools = assemble()
         response = client.messages.create(
             model=model,
             max_tokens=max_tokens,
@@ -297,6 +341,8 @@ def run_loop_local(
         verbose: bool = True,
         db_path: str | None = None,
         cache_out: dict | None = None,
+        dynamic_tools_path: str | None = _DEFAULT_DYNAMIC_TOOLS_PATH,
+        allow_create: bool = True,
 ) -> str:
     """
     Run a tool-call loop against a local Ollama model until it returns
@@ -315,6 +361,14 @@ def run_loop_local(
                    tools are added automatically.
         cache_out: Optional dict populated with {query_id: DataFrame} entries
                    after the loop finishes. Only used when db_path is set.
+        dynamic_tools_path: Path to the JSON file where dynamic tools are
+                   persisted. Loaded if it exists, created on first save.
+                   Defaults to dynamic_tools/dynamic_tools.json. Pass None to
+                   disable dynamic tools entirely.
+        allow_create: When True (default), the model gets a create_tool tool
+                   and tools it creates mid-session become callable on the
+                   next turn. Set False to expose saved dynamic tools
+                   read-only.
 
     Returns:
         The model's final plain-text response.
@@ -325,17 +379,23 @@ def run_loop_local(
     if db_path is not None:
         _cache = QueryCache()
         tools = tools + make_sql_tools(db_path, _cache)
+    registry = _make_registry(dynamic_tools_path, db_path)
+    if registry is not None and allow_create:
+        tools = tools + [registry.create_tool_fn()]
 
-    tool_registry = {fn.__name__: fn for fn in tools}
+    def assemble():
+        all_tools = tools + (registry.callables() if registry is not None else [])
+        return all_tools, {fn.__name__: fn for fn in all_tools}
 
     if not messages or messages[0].get("role") != "system":
         messages.insert(0, {"role": "system", "content": system})
 
     while True:
+        active_tools, tool_registry = assemble()
         response = chat(
             model=model,
             messages=messages,
-            tools=tools,
+            tools=active_tools,
             options={"temperature": 0.1},
         )
 
@@ -559,6 +619,7 @@ class DynamicToolRegistry:
             self._register(name, entry["description"], entry["code"], entry["reason"], save=False)
 
     def _save(self):
+        os.makedirs(os.path.dirname(self.file_path) or ".", exist_ok=True)
         with open(self.file_path, "w") as f:
             json.dump(self._tools, f, indent=2)
 
