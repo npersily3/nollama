@@ -2,6 +2,8 @@
 
 Lightweight agentic loop infrastructure for Claude and local Ollama projects. Drop it into any project and build tool-calling agents in minutes — no framework required.
 
+> For how the pieces fit together internally, see [nollama/ARCHITECTURE.md](nollama/ARCHITECTURE.md).
+
 ## Installation
 
 ```bash
@@ -158,6 +160,48 @@ def analyze(question: str) -> str:
     else:
         return run_loop_local(LOCAL_MODEL, SYSTEM, messages, [], db_path=DB_PATH, cache_out=cache_out)
 ```
+
+---
+
+## SQL auto-repair
+
+Give the SQL tools a fix agent and a failed query gets one automatic repair attempt — the broken SQL, the error, and the live schema go to a model that returns corrected SQLite, which is then retried.
+
+Auto-repair is wired in by building the SQL tools yourself with a `fix_fn` and passing them as ordinary tools (instead of using `db_path`):
+
+```python
+from nollama.agent_framework import make_sql_tools, make_claude_fix_fn, QueryCache
+
+cache  = QueryCache()
+fix_fn = make_claude_fix_fn(client, "claude-sonnet-4-6", db_path="my.db")
+sql_tools = make_sql_tools("my.db", cache, fix_fn=fix_fn)
+
+answer = run_loop_claude(client, "claude-sonnet-4-6", SYSTEM, messages, sql_tools)
+df = cache.get("q1")   # same QueryCache you passed in
+```
+
+Use `make_ollama_fix_fn(db_path, model="gemma3")` for a local repair model. One retry only — a second failure returns both errors.
+
+---
+
+## Dynamic tools (model-authored)
+
+When `allow_create=True` (the default), the model gets a `create_tool` tool and can write its own Python tools mid-session. A tool it creates on one turn is callable on the next, and tools are persisted to `dynamic_tools/dynamic_tools.json` so they survive restarts.
+
+```python
+# Tools the model created in past sessions load automatically.
+answer = run_loop_claude(client, model, SYSTEM, messages, [my_tool], db_path="my.db")
+
+# Read-only: expose saved tools but don't let the model create new ones.
+answer = run_loop_claude(..., allow_create=False)
+
+# Off entirely.
+answer = run_loop_claude(..., dynamic_tools_path=None)
+```
+
+Override the persistence file with `dynamic_tools_path="path/to/tools.json"`.
+
+> ⚠️ `create_tool` runs model-generated Python via `exec`. It is **not** a sandbox — only enable it with a model and database you trust. Set `allow_create=False` or `dynamic_tools_path=None` for untrusted use. See [ARCHITECTURE.md](nollama/ARCHITECTURE.md#5-dynamic-tool-registry--dynamictoolregistry) for details.
 
 ---
 
